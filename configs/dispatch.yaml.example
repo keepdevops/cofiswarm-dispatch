@@ -1,0 +1,5 @@
+listen: ":8010"
+state: /var/lib/cofiswarm/dispatch
+agent_registry: http://127.0.0.1:8012
+slot_manager: http://127.0.0.1:8013
+kvpool: http://127.0.0.1:8014

@@ -1,20 +1,33 @@
 # cofiswarm-dispatch
 
-Cofiswarm component: `dispatch`.
+Orchestration shell: architect dispatch, SSE streaming, sessions, history, RAG inject (extracted from coordinator).
 
-- Layout: [REPO-STANDARD-LAYOUT](https://github.com/keepdevops/cofiswarmdev/blob/main/docs/REPO-STANDARD-LAYOUT.md)
-- Migration: [MIGRATION-SPRINTS](https://github.com/keepdevops/cofiswarmdev/blob/main/docs/MIGRATION-SPRINTS.md)
+- Migration: Sprint 8 in [MIGRATION-SPRINTS](https://github.com/keepdevops/cofiswarmdev/blob/main/docs/MIGRATION-SPRINTS.md)
+- SSE contract: `spec/sse-events.md` (from stream-sdk)
+- Legacy C++: `legacy/cpp/`
 
-## FHS paths
+## HTTP
+
+| Route | Description |
+|-------|-------------|
+| `GET /healthz` | Liveness |
+| `POST /api/architect` | Non-streaming dispatch (stub → full mode wiring sprint 9) |
+| `POST /api/architect/stream` | SSE flat-mode stub stream |
+| `GET /api/history` | Full history array |
+| `GET /api/history/search?q=` | Search history |
+| `POST /api/history/entry` | Append history row |
+
+Default listen: `:8010`.
+
+## FHS state
 
 | Path | Purpose |
 |------|---------|
-| `/etc/cofiswarm/dispatch/` | config |
-| `/var/lib/cofiswarm/dispatch/` | state |
-| `/var/log/cofiswarm/dispatch/` | logs |
+| `/var/lib/cofiswarm/dispatch/sessions/sessions.json` | conversation threads |
+| `/var/lib/cofiswarm/dispatch/history/history.json` | run history |
 
 ## Test
 
 ```bash
-./test/scripts/assert-layout.sh dispatch
+make test   # layout + SSE gate + session persistence
 ```
