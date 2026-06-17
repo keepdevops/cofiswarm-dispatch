@@ -2,23 +2,32 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/keepdevops/cofiswarm-dispatch/internal/compat"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/history"
+	"github.com/keepdevops/cofiswarm-dispatch/internal/modes"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/session"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/stream"
 )
 
+// Alerter publishes a dependency-aware alert to the bus (satisfied by buspresence.Publisher).
+type Alerter interface {
+	Alert(message string)
+}
+
 type Server struct {
 	sessions *session.Store
 	history  *history.Store
+	alerter  Alerter // optional; nil when the bus is disabled
 }
 
-func New(sessions *session.Store, hist *history.Store) *Server {
-	return &Server{sessions: sessions, history: hist}
+func New(sessions *session.Store, hist *history.Store, alerter Alerter) *Server {
+	return &Server{sessions: sessions, history: hist, alerter: alerter}
 }
 
 func cors(w http.ResponseWriter) {
@@ -74,14 +83,16 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/api/architect", s.handleArchitect)
 	mux.HandleFunc("/api/architect/stream", s.handleArchitectStream)
+	compat.Register(mux)
 	return mux
 }
 
 type architectBody struct {
-	Prompt    string `json:"prompt"`
-	SessionID string `json:"session_id"`
-	Followup  bool   `json:"followup"`
-	Mode      string `json:"mode"`
+	Prompt     string         `json:"prompt"`
+	SessionID  string         `json:"session_id"`
+	Followup   bool           `json:"followup"`
+	Mode       string         `json:"mode"`
+	ModeConfig map[string]any `json:"mode_config"`
 }
 
 func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
@@ -103,13 +114,33 @@ func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
 	runID := s.sessions.NewID("run")
 	mode := body.Mode
 	if mode == "" {
-		mode = "flat"
+		mode = modes.ActiveMode()
+	} else {
+		mode = modes.Normalize(mode)
+	}
+	var envelope map[string]any
+	if env, err := modes.Execute(mode, body.Prompt, body.ModeConfig); err == nil {
+		envelope = env
+		if meta, ok := envelope["meta"].(map[string]any); ok {
+			meta["relay"] = true
+		} else {
+			envelope["meta"] = map[string]any{"relay": true}
+		}
+	} else {
+		final := body.Prompt
+		envelope = map[string]any{
+			"mode": mode, "final": final,
+			"agents": map[string]string{"architect": final},
+			"meta": map[string]any{
+				"stub": true, "relay_error": err.Error(),
+			},
+		}
 	}
 	final := body.Prompt
-	envelope := map[string]any{
-		"mode": mode, "final": final,
-		"agents": map[string]string{"architect": final},
-		"meta":   map[string]any{"stub": true, "note": "full mode dispatch in sprint 9+"},
+	if f, ok := envelope["final"].(string); ok {
+		final = f
+	} else if f, ok := envelope["final"].(*string); ok && f != nil {
+		final = *f
 	}
 	_ = s.sessions.AppendRun(sid, map[string]any{
 		"run_id": runID, "prompt": body.Prompt, "effective_prompt": body.Prompt,
@@ -131,24 +162,57 @@ func (s *Server) handleArchitectStream(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty prompt"})
 		return
 	}
+	s.handleArchitectStreamBody(w, r, body)
+}
+
+func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Request, body architectBody) {
 	sid := body.SessionID
 	if sid == "" {
 		sid = s.sessions.NewID("sess")
 	}
 	runID := s.sessions.NewID("run")
+	mode := body.Mode
+	if mode == "" {
+		mode = modes.ActiveMode()
+	} else {
+		mode = modes.Normalize(mode)
+	}
+	if err := modes.StreamRelay(mode, body.Prompt, sid, body.ModeConfig, w); err == nil {
+		_ = s.sessions.AppendRun(sid, map[string]any{
+			"run_id": runID, "prompt": body.Prompt, "effective_prompt": body.Prompt,
+			"followup": body.Followup, "mode": mode, "stream": true,
+			"timestamp": time.Now().UnixMilli(),
+		})
+		return
+	} else if s.alerter != nil {
+		// Dependency-aware: the needed mode service is unavailable — tell the observer.
+		s.alerter.Alert(fmt.Sprintf("mode %q stream relay unavailable: %v", mode, err))
+	}
 	sw, err := stream.NewWriter(w)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	agent := "architect"
-	if err := stream.EmitFlatStub(sw, sid, agent, body.Prompt); err != nil {
+	prompt := body.Prompt
+	if env, err := modes.Execute(mode, prompt, body.ModeConfig); err == nil {
+		if f, ok := env["final"].(string); ok && f != "" {
+			prompt = f
+		}
+		if agents, ok := env["agents"].(map[string]any); ok {
+			for k := range agents {
+				agent = k
+				break
+			}
+		}
+	}
+	if err := stream.EmitFlatStub(sw, sid, agent, prompt); err != nil {
 		return
 	}
-	final := strings.TrimSpace(body.Prompt)
+	final := strings.TrimSpace(prompt)
 	_ = s.sessions.AppendRun(sid, map[string]any{
 		"run_id": runID, "prompt": body.Prompt, "effective_prompt": body.Prompt,
-		"followup": body.Followup, "mode": "flat", "final": final,
+		"followup": body.Followup, "mode": mode, "final": final,
 		"agents": map[string]string{agent: final},
 		"timestamp": time.Now().UnixMilli(),
 	})
