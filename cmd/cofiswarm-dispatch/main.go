@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 
+	"github.com/keepdevops/cofiswarm-dispatch/internal/buspresence"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/history"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/httpapi"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/session"
@@ -33,6 +35,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Optional: join the observer bus (default-off). Announces dispatch presence and
+	// publishes dependency alerts when a mode relay is unavailable.
+	var alerter httpapi.Alerter
+	if base := os.Getenv("COFISWARM_BRIDGE_URL"); base != "" {
+		pub := buspresence.New(base)
+		pub.Announce()
+		go pub.WatchHello(context.Background())
+		alerter = pub
+		log.Printf("dispatch publishing presence/alerts to bus via %s", base)
+	}
+
 	log.Printf("dispatch listening on %s (sessions=%d history=%d)", *addr, sessions.Count(), hist.Len())
-	log.Fatal(http.ListenAndServe(*addr, httpapi.New(sessions, hist).Handler()))
+	log.Fatal(http.ListenAndServe(*addr, httpapi.New(sessions, hist, alerter).Handler()))
 }
