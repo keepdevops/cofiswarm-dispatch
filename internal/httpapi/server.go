@@ -127,6 +127,9 @@ func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
 			envelope["meta"] = map[string]any{"relay": true}
 		}
 	} else {
+		if s.alerter != nil {
+			s.alerter.Alert(fmt.Sprintf("mode %q execute unavailable: %v", mode, err))
+		}
 		final := body.Prompt
 		envelope = map[string]any{
 			"mode": mode, "final": final,

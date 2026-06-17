@@ -75,7 +75,55 @@ func ActiveMode() string {
 	return Normalize(out.Mode)
 }
 
+// busRouteURL returns the bridge base URL when bus routing is enabled (both
+// COFISWARM_ROUTE_BUS and COFISWARM_BRIDGE_URL set), else "".
+func busRouteURL() string {
+	if os.Getenv("COFISWARM_ROUTE_BUS") == "" {
+		return ""
+	}
+	base := os.Getenv("COFISWARM_BRIDGE_URL")
+	if base == "" {
+		return ""
+	}
+	return strings.TrimRight(base, "/")
+}
+
+// executeViaBus routes a non-streaming mode execution over the bus through the bridge's
+// /v1/request gateway. A dead mode responder surfaces as 503 (no responders) / 504 (timeout).
+func executeViaBus(bridge, mode, prompt string, modeConfig map[string]any) (map[string]any, error) {
+	payload := map[string]any{"prompt": prompt}
+	if len(modeConfig) > 0 {
+		payload["mode_config"] = modeConfig
+	}
+	reqBody, _ := json.Marshal(map[string]any{
+		"subject": "swarm.observer.mode." + Normalize(mode), "payload": payload,
+		"timeout_ms": 120000,
+	})
+	resp, err := http.Post(bridge+"/v1/request", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	switch {
+	case resp.StatusCode == http.StatusServiceUnavailable:
+		return nil, fmt.Errorf("no responder for mode %q (component down)", mode)
+	case resp.StatusCode == http.StatusGatewayTimeout:
+		return nil, fmt.Errorf("mode %q timed out", mode)
+	case resp.StatusCode >= 300:
+		return nil, fmt.Errorf("bus route mode %s: %s", mode, string(raw))
+	}
+	var env map[string]any
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
 func Execute(mode, prompt string, modeConfig map[string]any) (map[string]any, error) {
+	if bridge := busRouteURL(); bridge != "" {
+		return executeViaBus(bridge, mode, prompt, modeConfig)
+	}
 	port, ok := Port(mode)
 	if !ok {
 		return nil, fmt.Errorf("unknown mode %q", mode)
