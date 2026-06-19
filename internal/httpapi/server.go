@@ -10,6 +10,7 @@ import (
 
 	"github.com/keepdevops/cofiswarm-dispatch/internal/compat"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/history"
+	"github.com/keepdevops/cofiswarm-dispatch/internal/kvpool"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/modes"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/session"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/stream"
@@ -28,6 +29,29 @@ type Server struct {
 
 func New(sessions *session.Store, hist *history.Store, alerter Alerter) *Server {
 	return &Server{sessions: sessions, history: hist, alerter: alerter}
+}
+
+// gateKV consults the kvpool sidecar's token-budget gate (if COFISWARM_KVPOOL_URL is set).
+// Returns false + reason when the run is denied (and emits a bus alert). Fails open when
+// gating is disabled or kvpool is unreachable — a down policy sidecar must not block runs.
+func (s *Server) gateKV(mode, prompt string) (bool, string) {
+	base := kvpool.URL()
+	if base == "" {
+		return true, ""
+	}
+	toks := kvpool.EstimateTokens(prompt)
+	allowed, reason := kvpool.Admit(base, modes.Normalize(mode), toks)
+	if !allowed && s.alerter != nil {
+		s.alerter.Alert(fmt.Sprintf("KV budget gate: mode %q denied (%s, ~%d tok)", mode, reason, toks))
+	}
+	return allowed, reason
+}
+
+func writeBudgetDenied(w http.ResponseWriter, mode, reason string) {
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": "kv_token_budget_exceeded", "reason": reason, "mode": mode,
+	})
 }
 
 func cors(w http.ResponseWriter) {
@@ -118,6 +142,10 @@ func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
 	} else {
 		mode = modes.Normalize(mode)
 	}
+	if ok, reason := s.gateKV(mode, body.Prompt); !ok {
+		writeBudgetDenied(w, mode, reason)
+		return
+	}
 	var envelope map[string]any
 	if env, err := modes.Execute(mode, body.Prompt, body.ModeConfig); err == nil {
 		envelope = env
@@ -179,6 +207,10 @@ func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Reques
 		mode = modes.ActiveMode()
 	} else {
 		mode = modes.Normalize(mode)
+	}
+	if ok, reason := s.gateKV(mode, body.Prompt); !ok {
+		writeBudgetDenied(w, mode, reason)
+		return
 	}
 	if err := modes.StreamRelay(mode, body.Prompt, sid, body.ModeConfig, w); err == nil {
 		_ = s.sessions.AppendRun(sid, map[string]any{
