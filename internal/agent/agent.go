@@ -26,6 +26,7 @@ type Agent struct {
 	MaxInputTokens   int      `json:"max_input_tokens"`
 	MaxOutputTokens  int      `json:"max_output_tokens"`
 	MaxTokens        int      `json:"max_tokens"`
+	ContextWindow    int      `json:"context_window"`
 	ReadTimeoutSecs  int      `json:"read_timeout_secs"`
 }
 
