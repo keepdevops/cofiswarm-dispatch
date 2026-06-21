@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/keepdevops/cofiswarm-dispatch/internal/agent"
+	"github.com/keepdevops/cofiswarm-dispatch/internal/backend"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/compat"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/history"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/kvpool"
@@ -24,11 +26,15 @@ type Alerter interface {
 type Server struct {
 	sessions *session.Store
 	history  *history.Store
-	alerter  Alerter // optional; nil when the bus is disabled
+	alerter  Alerter         // optional; nil when the bus is disabled
+	router   *backend.Router // backend routing decision engine (ported from the monolith)
+	agents   *agent.Client   // per-agent inference caller (ported from the monolith)
 }
 
 func New(sessions *session.Store, hist *history.Store, alerter Alerter) *Server {
-	return &Server{sessions: sessions, history: hist, alerter: alerter}
+	r := backend.New()
+	r.ConfigureFromStartup(nil) // env-driven (COFISWARM_BACKEND_ROUTING / _LLAMA_METAL_PRIORITY)
+	return &Server{sessions: sessions, history: hist, alerter: alerter, router: r, agents: agent.NewClient(r)}
 }
 
 // gateKV consults the kvpool sidecar's token-budget gate (if COFISWARM_KVPOOL_URL is set).
@@ -107,6 +113,8 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/api/architect", s.handleArchitect)
 	mux.HandleFunc("/api/architect/stream", s.handleArchitectStream)
+	s.registerBackendRoutes(mux)
+	s.registerAgentRoutes(mux)
 	compat.Register(mux)
 	return mux
 }
