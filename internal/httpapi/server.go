@@ -122,6 +122,7 @@ func (s *Server) Handler() http.Handler {
 	s.registerBackendRoutes(mux)
 	s.registerAgentRoutes(mux)
 	s.registerRAGRoutes(mux)
+	s.registerSessionRoutes(mux)
 	compat.Register(mux)
 	return mux
 }
