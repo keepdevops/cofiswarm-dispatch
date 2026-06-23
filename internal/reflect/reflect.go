@@ -7,12 +7,18 @@ package reflect
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 
 	"github.com/keepdevops/cofiswarm-dispatch/internal/history"
 )
+
+// ErrUnusable wraps deterministic failures where the reflector's output cannot be used no matter how
+// many times we retry the same episodes (empty completion, no parseable JSON array). The caller uses
+// errors.Is to skip such a poison window rather than re-reflecting it forever.
+var ErrUnusable = errors.New("reflector output unusable")
 
 // Completer runs an LLM completion (system + user) and returns the raw text. Implemented by an
 // adapter over the agent client (a reflector Agent).
@@ -74,13 +80,13 @@ func Reflect(eps []history.Episode, c Completer, sink MemorySink, maxEpisodeChar
 	raw := c.Complete(SystemPrompt, b.String())
 	if strings.TrimSpace(raw) == "" {
 		log.Printf("[reflect] empty completion over %d episodes", len(eps))
-		return res, fmt.Errorf("reflector returned empty completion")
+		return res, fmt.Errorf("%w: empty completion", ErrUnusable)
 	}
 
 	lessons, err := parseLessons(raw)
 	if err != nil {
 		log.Printf("[reflect] parse lessons failed: %v", err)
-		return res, err
+		return res, fmt.Errorf("%w: %v", ErrUnusable, err)
 	}
 	res.Proposed = len(lessons)
 	for _, l := range lessons {
