@@ -9,14 +9,23 @@ import (
 )
 
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	doc  map[string]any
+	mu      sync.RWMutex
+	path    string
+	doc     map[string]any
+	onEvict func(sessionID string, evicted []map[string]any) // optional episodic sink (Phase B, B3)
 }
 
 func New(path string) (*Store, error) {
 	s := &Store{path: path, doc: map[string]any{}}
 	return s, s.Load()
+}
+
+// SetEvictHook registers a sink for runs dropped by working-memory compaction. The hook runs
+// outside the store lock after the append is persisted; nil (the default) disables hand-off.
+func (s *Store) SetEvictHook(fn func(sessionID string, evicted []map[string]any)) {
+	s.mu.Lock()
+	s.onEvict = fn
+	s.mu.Unlock()
 }
 
 func (s *Store) Load() error {
@@ -81,7 +90,6 @@ func (s *Store) NewID(prefix string) string {
 
 func (s *Store) AppendRun(sessionID string, run map[string]any) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := float64(time.Now().UnixMilli())
 	sess, _ := s.doc[sessionID].(map[string]any)
 	if sess == nil {
@@ -94,8 +102,19 @@ func (s *Store) AppendRun(sessionID string, run map[string]any) error {
 	sess["updated_at"] = now
 	runs, _ := sess["runs"].([]any)
 	sess["runs"] = append(runs, run)
+	// Self-managing working memory: evict weak old runs beyond the budget, folding each into the
+	// session's rolling summary so long-horizon context survives (Phase B, Tier 1).
+	evicted := compactSession(sess, defaultSessionBudgetChars)
 	s.doc[sessionID] = sess
-	return s.saveLocked()
+	err := s.saveLocked()
+	hook := s.onEvict
+	s.mu.Unlock()
+
+	// Hand evicted runs to the episodic sink outside the lock (Phase B, B3 → Phase C).
+	if err == nil && hook != nil && len(evicted) > 0 {
+		hook(sessionID, evicted)
+	}
+	return err
 }
 
 func (s *Store) Count() int {
