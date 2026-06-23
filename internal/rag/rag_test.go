@@ -1,78 +1,66 @@
 package rag
 
 import (
-	"math"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-func TestHashEmbedInvariants(t *testing.T) {
-	v := HashEmbed("the quick brown fox")
-	if len(v) != EmbedDim {
-		t.Fatalf("dim = %d, want %d", len(v), EmbedDim)
-	}
-	var sumsq float64
-	for _, x := range v {
-		sumsq += x * x
-	}
-	if norm := math.Sqrt(sumsq); math.Abs(norm-1.0) > 1e-9 {
-		t.Errorf("not L2-normalized: norm = %v", norm)
-	}
-	// Deterministic and input-sensitive.
-	if VecLiteral(HashEmbed("the quick brown fox")) != VecLiteral(v) {
-		t.Error("not deterministic")
-	}
-	if VecLiteral(HashEmbed("a different sentence")) == VecLiteral(v) {
-		t.Error("different inputs produced identical embeddings")
-	}
-}
-
-func TestHashEmbedEmptyUsesWholeString(t *testing.T) {
-	// All-whitespace -> no tokens -> falls back to the whole string as one token (still normalized).
-	v := HashEmbed("   \t\n  ")
-	var sumsq float64
-	for _, x := range v {
-		sumsq += x * x
-	}
-	if math.Abs(math.Sqrt(sumsq)-1.0) > 1e-9 {
-		t.Errorf("whitespace input should still normalize, norm=%v", math.Sqrt(sumsq))
-	}
-}
-
-func TestVecLiteralFormat(t *testing.T) {
-	if got := VecLiteral([]float64{0.5, -1, 0}); got != "[0.500000,-1.000000,0.000000]" {
-		t.Fatalf("VecLiteral = %q", got)
-	}
-}
-
 func TestSettingsFromConfigAndEnvOverride(t *testing.T) {
 	s := SettingsFromConfig(map[string]any{
-		"enabled": true, "top_k": float64(5), "min_score": 0.4, "embedder": "mlx", "dsn": "from-config",
+		"enabled": true, "top_k": float64(5), "min_score": 0.4, "retrieve_url": "http://from-config",
 	})
-	if !s.Enabled || s.TopK != 5 || s.MinScore != 0.4 || s.Embedder != "mlx" || s.DSN != "from-config" {
+	if !s.Enabled || s.TopK != 5 || s.MinScore != 0.4 || s.RetrieveURL != "http://from-config" {
 		t.Fatalf("parsed wrong: %+v", s)
 	}
-	t.Setenv("RAG_DSN", "from-env")
-	if got := SettingsFromConfig(map[string]any{"dsn": "from-config"}); got.DSN != "from-env" {
-		t.Errorf("RAG_DSN must override dsn: %q", got.DSN)
+	t.Setenv("COFISWARM_RAG_URL", "http://from-env")
+	if got := SettingsFromConfig(map[string]any{"retrieve_url": "http://from-config"}); got.RetrieveURL != "http://from-env" {
+		t.Errorf("COFISWARM_RAG_URL must override retrieve_url: %q", got.RetrieveURL)
 	}
 }
 
-func TestMLXEmbedViaSidecar(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"vectors":[[0.1,0.2,0.3]]}`))
+func TestRetrieveViaService(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/retrieve" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		var body struct {
+			Query string   `json:"query"`
+			K     int      `json:"k"`
+			Kinds []string `json:"kinds"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		if body.Query != "q" || body.K != 3 {
+			t.Errorf("bad request body: %+v", body)
+		}
+		_, _ = w.Write([]byte(`{"chunks":[
+			{"content":"near","source_path":"a.md","chunk_idx":1,"distance":0.2,"kind":"fact"},
+			{"content":"far","source_path":"b.md","chunk_idx":0,"distance":0.9}
+		]}`))
 	}))
 	defer ts.Close()
+
 	c := NewClient()
-	got := c.mlxEmbed(ts.URL, "q")
-	if len(got) != 3 || got[0] != 0.1 {
-		t.Fatalf("mlxEmbed = %v", got)
+	s := Settings{Enabled: true, TopK: 3, MinScore: 0.5, RetrieveURL: ts.URL}
+	hits := c.Retrieve(s, "q")
+	// MinScore=0.5 filters out the distance=0.9 hit.
+	if len(hits) != 1 {
+		t.Fatalf("want 1 hit after min_score filter, got %d: %+v", len(hits), hits)
 	}
-	// Bad sidecar -> empty, not a panic.
-	if v := c.mlxEmbed("http://127.0.0.1:1/embed", "q"); v != nil {
-		t.Errorf("unreachable sidecar should yield nil, got %v", v)
+	if hits[0].SourcePath != "a.md" || hits[0].Kind != "fact" || hits[0].Distance != 0.2 {
+		t.Errorf("unexpected hit: %+v", hits[0])
+	}
+}
+
+func TestRetrieveUnreachableDegrades(t *testing.T) {
+	c := NewClient()
+	s := Settings{Enabled: true, TopK: 3, MinScore: 1.0, RetrieveURL: "http://127.0.0.1:1"}
+	if hits := c.Retrieve(s, "q"); hits != nil {
+		t.Errorf("unreachable service should yield nil, got %v", hits)
 	}
 }
 
@@ -88,7 +76,7 @@ func TestRenderContextBlock(t *testing.T) {
 	}
 }
 
-// Retrieve/HealthCheck degrade gracefully without a DB when disabled.
+// Retrieve/HealthCheck degrade gracefully when disabled.
 func TestDisabledDegradesGracefully(t *testing.T) {
 	c := NewClient()
 	if hits := c.Retrieve(Settings{Enabled: false}, "q"); hits != nil {

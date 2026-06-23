@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/keepdevops/cofiswarm-dispatch/internal/history"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/kvpool"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/modes"
+	"github.com/keepdevops/cofiswarm-dispatch/internal/prepare"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/rag"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/session"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/stream"
@@ -30,7 +32,7 @@ type Server struct {
 	alerter  Alerter         // optional; nil when the bus is disabled
 	router   *backend.Router // backend routing decision engine (ported from the monolith)
 	agents   *agent.Client   // per-agent inference caller (ported from the monolith)
-	rag      *rag.Client     // pgvector retrieval client (ported from the monolith)
+	rag      *rag.Client     // HTTP client for the cofiswarm-rag service (sqlite-vec /retrieve)
 	ragCfg   rag.Settings    // env-derived rag settings
 }
 
@@ -127,12 +129,39 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-type architectBody struct {
-	Prompt     string         `json:"prompt"`
-	SessionID  string         `json:"session_id"`
-	Followup   bool           `json:"followup"`
-	Mode       string         `json:"mode"`
-	ModeConfig map[string]any `json:"mode_config"`
+// resolveMode picks the request's mode (normalized) or the active default.
+func resolveMode(mode string) string {
+	if mode == "" {
+		return modes.ActiveMode()
+	}
+	return modes.Normalize(mode)
+}
+
+// effectivePrompt applies follow-up continuation then rag augmentation to the raw prompt,
+// returning the prompt the mode should run on plus compaction + rag metadata for the envelope.
+func (s *Server) effectivePrompt(req prepare.Request) (string, map[string]any, prepare.RagResult) {
+	eff := req.Prompt
+	var compaction map[string]any
+	if req.Followup {
+		cont := s.sessions.BuildContinuation(req.SessionID, req.Prompt, req.ContextPolicy)
+		eff, compaction = cont.Prompt, cont.Compaction
+	}
+	ragRes := prepare.BuildRAG(req, eff, s.rag, s.ragCfg)
+	return ragRes.EffectivePrompt, compaction, ragRes
+}
+
+// withRoutingContext brackets fn with the backend router's dispatch context (mode + kv pressure),
+// returning the decision snapshot to stamp into meta. Mirrors set/clear_dispatch_context.
+func (s *Server) withRoutingContext(mode string, kvPressure float64, fn func()) map[string]any {
+	sequential := mode == "pipeline" || mode == "cascade" || mode == "router"
+	s.router.SetContext(backend.Context{ModeName: mode, SequentialMode: sequential, KVPressure: kvPressure})
+	fn()
+	var routing map[string]any
+	if s.router.Enabled() {
+		routing = s.router.SnapshotDecisions()
+	}
+	s.router.ClearContext()
+	return routing
 }
 
 func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
@@ -141,57 +170,51 @@ func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	var body architectBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prompt == "" {
+	raw, _ := io.ReadAll(r.Body)
+	req, err := prepare.Parse(raw, s.sessions.NewID)
+	if err != nil || req.Prompt == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty prompt"})
 		return
 	}
-	sid := body.SessionID
-	if sid == "" {
-		sid = s.sessions.NewID("sess")
-	}
-	runID := s.sessions.NewID("run")
-	mode := body.Mode
-	if mode == "" {
-		mode = modes.ActiveMode()
-	} else {
-		mode = modes.Normalize(mode)
-	}
-	if ok, reason := s.gateKV(mode, body.Prompt); !ok {
+	mode := resolveMode(req.Mode)
+	effPrompt, compaction, ragRes := s.effectivePrompt(req)
+	if ok, reason := s.gateKV(mode, effPrompt); !ok {
 		writeBudgetDenied(w, mode, reason)
 		return
 	}
+
 	var envelope map[string]any
-	if env, err := modes.Execute(mode, body.Prompt, body.ModeConfig); err == nil {
-		envelope = env
-		if meta, ok := envelope["meta"].(map[string]any); ok {
-			meta["relay"] = true
+	t0 := time.Now()
+	routing := s.withRoutingContext(mode, req.KVPressure, func() {
+		if env, err := modes.Execute(mode, effPrompt, req.ModeConfig); err == nil {
+			envelope = env
+			if meta, ok := envelope["meta"].(map[string]any); ok {
+				meta["relay"] = true
+			} else {
+				envelope["meta"] = map[string]any{"relay": true}
+			}
 		} else {
-			envelope["meta"] = map[string]any{"relay": true}
+			if s.alerter != nil {
+				s.alerter.Alert(fmt.Sprintf("mode %q execute unavailable: %v", mode, err))
+			}
+			envelope = map[string]any{
+				"mode": mode, "final": effPrompt,
+				"agents": map[string]string{"architect": effPrompt},
+				"meta":   map[string]any{"stub": true, "relay_error": err.Error()},
+			}
 		}
-	} else {
-		if s.alerter != nil {
-			s.alerter.Alert(fmt.Sprintf("mode %q execute unavailable: %v", mode, err))
-		}
-		final := body.Prompt
-		envelope = map[string]any{
-			"mode": mode, "final": final,
-			"agents": map[string]string{"architect": final},
-			"meta": map[string]any{
-				"stub": true, "relay_error": err.Error(),
-			},
-		}
-	}
-	final := body.Prompt
+	})
+	wallMs := float64(time.Since(t0).Microseconds()) / 1000.0
+	prepare.StampMeta(envelope, req, ragRes, compaction, wallMs, routing)
+
+	final := effPrompt
 	if f, ok := envelope["final"].(string); ok {
 		final = f
-	} else if f, ok := envelope["final"].(*string); ok && f != nil {
-		final = *f
 	}
-	_ = s.sessions.AppendRun(sid, map[string]any{
-		"run_id": runID, "prompt": body.Prompt, "effective_prompt": body.Prompt,
-		"followup": body.Followup, "mode": mode, "final": final,
+	_ = s.sessions.AppendRun(req.SessionID, map[string]any{
+		"run_id": req.RunID, "prompt": req.Prompt, "effective_prompt": effPrompt,
+		"followup": req.Followup, "mode": mode, "final": final,
 		"agents": envelope["agents"], "timestamp": time.Now().UnixMilli(),
 	})
 	_ = json.NewEncoder(w).Encode(envelope)
@@ -203,35 +226,27 @@ func (s *Server) handleArchitectStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	var body architectBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prompt == "" {
+	raw, _ := io.ReadAll(r.Body)
+	req, err := prepare.Parse(raw, s.sessions.NewID)
+	if err != nil || req.Prompt == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty prompt"})
 		return
 	}
-	s.handleArchitectStreamBody(w, r, body)
+	s.handleArchitectStreamBody(w, r, req)
 }
 
-func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Request, body architectBody) {
-	sid := body.SessionID
-	if sid == "" {
-		sid = s.sessions.NewID("sess")
-	}
-	runID := s.sessions.NewID("run")
-	mode := body.Mode
-	if mode == "" {
-		mode = modes.ActiveMode()
-	} else {
-		mode = modes.Normalize(mode)
-	}
-	if ok, reason := s.gateKV(mode, body.Prompt); !ok {
+func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Request, req prepare.Request) {
+	mode := resolveMode(req.Mode)
+	effPrompt, _, _ := s.effectivePrompt(req)
+	if ok, reason := s.gateKV(mode, effPrompt); !ok {
 		writeBudgetDenied(w, mode, reason)
 		return
 	}
-	if err := modes.StreamRelay(mode, body.Prompt, sid, body.ModeConfig, w); err == nil {
-		_ = s.sessions.AppendRun(sid, map[string]any{
-			"run_id": runID, "prompt": body.Prompt, "effective_prompt": body.Prompt,
-			"followup": body.Followup, "mode": mode, "stream": true,
+	if err := modes.StreamRelay(mode, effPrompt, req.SessionID, req.ModeConfig, w); err == nil {
+		_ = s.sessions.AppendRun(req.SessionID, map[string]any{
+			"run_id": req.RunID, "prompt": req.Prompt, "effective_prompt": effPrompt,
+			"followup": req.Followup, "mode": mode, "stream": true,
 			"timestamp": time.Now().UnixMilli(),
 		})
 		return
@@ -245,8 +260,8 @@ func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Reques
 		return
 	}
 	agent := "architect"
-	prompt := body.Prompt
-	if env, err := modes.Execute(mode, prompt, body.ModeConfig); err == nil {
+	prompt := effPrompt
+	if env, err := modes.Execute(mode, prompt, req.ModeConfig); err == nil {
 		if f, ok := env["final"].(string); ok && f != "" {
 			prompt = f
 		}
@@ -257,13 +272,13 @@ func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Reques
 			}
 		}
 	}
-	if err := stream.EmitFlatStub(sw, sid, agent, prompt); err != nil {
+	if err := stream.EmitFlatStub(sw, req.SessionID, agent, prompt); err != nil {
 		return
 	}
 	final := strings.TrimSpace(prompt)
-	_ = s.sessions.AppendRun(sid, map[string]any{
-		"run_id": runID, "prompt": body.Prompt, "effective_prompt": body.Prompt,
-		"followup": body.Followup, "mode": mode, "final": final,
+	_ = s.sessions.AppendRun(req.SessionID, map[string]any{
+		"run_id": req.RunID, "prompt": req.Prompt, "effective_prompt": effPrompt,
+		"followup": req.Followup, "mode": mode, "final": final,
 		"agents": map[string]string{agent: final},
 		"timestamp": time.Now().UnixMilli(),
 	})
