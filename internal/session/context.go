@@ -36,7 +36,7 @@ func latestRun(sessions map[string]any, sessionID string) map[string]any {
 }
 
 func buildContinuation(sessions map[string]any, sessionID, followup string, policy map[string]any, prev map[string]any) Continuation {
-	maxChars := policyInt(policy, "max_context_chars", 24000)
+	maxChars, maxTokens := resolveCharBudget(policy)
 	targetAgent := policyStr(policy, "target_agent", "programmer")
 	compacted := false
 
@@ -46,6 +46,13 @@ func buildContinuation(sessions map[string]any, sessionID, followup string, poli
 		"Use the prior context below, then answer the new follow-up. " +
 		"Do not restart from scratch unless the follow-up asks you to.\n")
 
+	if includeName(policy, "summary") {
+		if sum := sessionSummary(sessions, sessionID); sum != "" {
+			budget := maxChars / 3
+			compacted = compacted || len(sum) > budget
+			appendSection(&b, "Earlier session summary", trimBlock(sum, budget))
+		}
+	}
 	if includeName(policy, "original_prompt") {
 		budget := maxChars / 5
 		compacted = compacted || len(original) > budget
@@ -93,14 +100,16 @@ func buildContinuation(sessions map[string]any, sessionID, followup string, poli
 		built = trimBlock(built, maxChars-followupBudget) + "\n\n## User follow-up\n" + trimBlock(followup, followupBudget)
 	}
 
-	return Continuation{
-		Prompt: built,
-		Compaction: map[string]any{
-			"used":              compacted,
-			"max_context_chars": maxChars,
-			"original_chars":    len(original),
-			"built_chars":       len(built),
-			"target_agent":      targetAgent,
-		},
+	compaction := map[string]any{
+		"used":              compacted,
+		"max_context_chars": maxChars,
+		"original_chars":    len(original),
+		"built_chars":       len(built),
+		"est_tokens":        EstimateTokens(built),
+		"target_agent":      targetAgent,
 	}
+	if maxTokens > 0 { // budget was sized to the target server group's context window
+		compaction["max_context_tokens"] = maxTokens
+	}
+	return Continuation{Prompt: built, Compaction: compaction}
 }

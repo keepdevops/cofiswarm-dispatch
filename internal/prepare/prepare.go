@@ -29,15 +29,24 @@ type Request struct {
 	RagTopK       int            `json:"rag_top_k"`
 	RagMinScore   float64        `json:"rag_min_score"`
 	RagAgents     []string       `json:"rag_agents"`
+	RagKinds      []string       `json:"rag_kinds"`  // restrict use_rag retrieval to these memory kinds
+	UseMemory     bool           `json:"use_memory"` // inject declarative memory (default true via Parse)
 	Mode          string         `json:"mode"`
 	ModeConfig    map[string]any `json:"mode_config"`
 	KVPressure    float64        `json:"kv_pressure"`
 }
 
+// MemoryKinds are the declarative-memory kinds injected on every prompt as always-on context,
+// independent of use_rag (Phase A, Tier 2).
+var MemoryKinds = []string{"fact", "preference"}
+
+const defaultMemoryTopK = 3
+
 // Parse decodes a dispatch body, applying the monolith's defaults and minting session/run ids via
-// newID. rag_min_score defaults to -1 ("unset") so a caller can distinguish it from 0.0.
+// newID. rag_min_score defaults to -1 ("unset") so a caller can distinguish it from 0.0; use_memory
+// defaults to true so long-term memory reaches every prompt unless explicitly disabled.
 func Parse(raw []byte, newID func(prefix string) string) (Request, error) {
-	r := Request{Temperature: 0.7, RagMinScore: -1}
+	r := Request{Temperature: 0.7, RagMinScore: -1, UseMemory: true}
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return Request{}, err
 	}
@@ -60,13 +69,47 @@ type Retriever interface {
 	Retrieve(rag.Settings, string) []rag.Hit
 }
 
-// BuildRAG augments effPrompt with retrieved context when use_rag is set (ports dispatch_build_rag,
-// minus the not-ported rerank + trajectory recording). Per-request top_k/min_score override the
-// base settings. When rag_agents is empty the context block is prepended to the prompt; otherwise
-// it is returned in RagBlock for the mode to route to those agents.
+// retrieveMemory fetches always-on declarative memory (facts/preferences) for the prompt,
+// independent of use_rag. Returns nil when disabled or memory is off.
+func retrieveMemory(req Request, retriever Retriever, base rag.Settings) []rag.Hit {
+	if !req.UseMemory || !base.Enabled {
+		return nil
+	}
+	ms := base
+	ms.Kinds = MemoryKinds
+	ms.TopK = defaultMemoryTopK
+	if base.TopK > 0 && base.TopK < defaultMemoryTopK {
+		ms.TopK = base.TopK
+	}
+	return retriever.Retrieve(ms, req.Prompt)
+}
+
+func memoryMeta(hits []rag.Hit) map[string]any {
+	items := make([]map[string]any, 0, len(hits))
+	for _, h := range hits {
+		items = append(items, map[string]any{
+			"source_path": h.SourcePath, "kind": h.Kind, "distance": h.Distance,
+		})
+	}
+	return map[string]any{"used": len(hits) > 0, "kinds": MemoryKinds, "hits": items}
+}
+
+// BuildRAG augments effPrompt with retrieved context (ports dispatch_build_rag, minus the
+// not-ported rerank + trajectory recording). Declarative memory (facts/preferences) is always
+// prepended when use_memory is set; document retrieval runs additionally when use_rag is set, with
+// per-request top_k/min_score/kinds overrides. When rag_agents is empty the document block is
+// prepended too; otherwise it is returned in RagBlock for the mode to route to those agents.
+// Memory always prepends to the prompt regardless of targeting.
 func BuildRAG(req Request, effPrompt string, retriever Retriever, base rag.Settings) RagResult {
 	out := RagResult{EffectivePrompt: effPrompt}
+	memHits := retrieveMemory(req, retriever, base)
+	memBlock := rag.RenderContextBlock(memHits)
+
 	if !req.UseRAG {
+		out.EffectivePrompt = memBlock + out.EffectivePrompt
+		if len(memHits) > 0 {
+			out.RagMeta = map[string]any{"requested": false, "used": false, "memory": memoryMeta(memHits)}
+		}
 		return out
 	}
 	s := base
@@ -78,7 +121,11 @@ func BuildRAG(req Request, effPrompt string, retriever Retriever, base rag.Setti
 	if req.RagMinScore >= 0 && req.RagMinScore <= 1 {
 		s.MinScore = req.RagMinScore
 	}
+	if len(req.RagKinds) > 0 {
+		s.Kinds = req.RagKinds
+	}
 	if !s.Enabled {
+		out.EffectivePrompt = memBlock + out.EffectivePrompt
 		out.RagMeta = map[string]any{"requested": true, "used": false, "reason": "rag.enabled is false"}
 		return out
 	}
@@ -90,16 +137,19 @@ func BuildRAG(req Request, effPrompt string, retriever Retriever, base rag.Setti
 			"source_path": h.SourcePath, "chunk_idx": h.ChunkIdx, "distance": h.Distance, "content": h.Content,
 		})
 	}
-	if block := rag.RenderContextBlock(hits); block != "" {
-		if len(req.RagAgents) == 0 {
-			out.EffectivePrompt = block + out.EffectivePrompt
-		} else {
-			out.RagBlock = block
-		}
+	docBlock := rag.RenderContextBlock(hits)
+	if len(req.RagAgents) == 0 {
+		out.EffectivePrompt = memBlock + docBlock + out.EffectivePrompt
+	} else {
+		out.EffectivePrompt = memBlock + out.EffectivePrompt
+		out.RagBlock = docBlock
 	}
 	out.RagMeta = map[string]any{
 		"requested": true, "used": len(hits) > 0,
 		"top_k": s.TopK, "min_score": s.MinScore, "hits": sources,
+	}
+	if len(memHits) > 0 {
+		out.RagMeta["memory"] = memoryMeta(memHits)
 	}
 	if len(req.RagAgents) > 0 {
 		out.RagMeta["targeted_agents"] = req.RagAgents

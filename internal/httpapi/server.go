@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -39,6 +40,20 @@ type Server struct {
 func New(sessions *session.Store, hist *history.Store, alerter Alerter) *Server {
 	r := backend.New()
 	r.ConfigureFromStartup(nil) // env-driven (COFISWARM_BACKEND_ROUTING / _LLAMA_METAL_PRIORITY)
+	// Working-memory evictions become episodic history (Phase B, B3 → Phase C reflection).
+	if hist != nil {
+		sessions.SetEvictHook(func(sessionID string, evicted []map[string]any) {
+			for _, run := range evicted {
+				entry := map[string]any{"session_id": sessionID, "source": "working_memory_evict"}
+				for k, v := range run {
+					entry[k] = v
+				}
+				if err := hist.Append(entry); err != nil {
+					log.Printf("[session] episodic hand-off failed for %s: %v", sessionID, err)
+				}
+			}
+		})
+	}
 	return &Server{
 		sessions: sessions, history: hist, alerter: alerter,
 		router: r, agents: agent.NewClient(r), rag: rag.NewClient(), ragCfg: rag.SettingsFromEnv(),
