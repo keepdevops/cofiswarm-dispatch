@@ -108,7 +108,11 @@ func RenderContextBlock(hits []Hit) string {
 	var b strings.Builder
 	b.WriteString("<context source=\"rag\">\n")
 	for i, h := range hits {
-		fmt.Fprintf(&b, "[#%d %s chunk=%d distance=%g]\n%s\n", i, h.SourcePath, h.ChunkIdx, h.Distance, h.Content)
+		if h.Kind != "" { // declarative memory — label provenance so the model knows authority
+			fmt.Fprintf(&b, "[#%d memory:%s %s distance=%g]\n%s\n", i, h.Kind, h.SourcePath, h.Distance, h.Content)
+		} else {
+			fmt.Fprintf(&b, "[#%d %s chunk=%d distance=%g]\n%s\n", i, h.SourcePath, h.ChunkIdx, h.Distance, h.Content)
+		}
 	}
 	b.WriteString("</context>\n\n")
 	return b.String()

@@ -76,6 +76,13 @@ func TestRenderContextBlock(t *testing.T) {
 	}
 }
 
+func TestRenderContextBlockLabelsMemory(t *testing.T) {
+	out := RenderContextBlock([]Hit{{SourcePath: "memory://preference/ui", Content: "dark", Distance: 0.1, Kind: "preference"}})
+	if !strings.Contains(out, "memory:preference") {
+		t.Errorf("memory hit not labeled by kind:\n%s", out)
+	}
+}
+
 // Retrieve/HealthCheck degrade gracefully when disabled.
 func TestDisabledDegradesGracefully(t *testing.T) {
 	c := NewClient()

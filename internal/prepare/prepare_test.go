@@ -80,6 +80,64 @@ func TestBuildRAGTargetedAgentsUsesBlockNotPrepend(t *testing.T) {
 	}
 }
 
+// kindRetriever returns memory hits when Kinds is set, document hits otherwise.
+type kindRetriever struct {
+	mem, docs []rag.Hit
+	calls     []rag.Settings
+}
+
+func (f *kindRetriever) Retrieve(s rag.Settings, _ string) []rag.Hit {
+	f.calls = append(f.calls, s)
+	if len(s.Kinds) > 0 {
+		return f.mem
+	}
+	return f.docs
+}
+
+func TestParseDefaultsMemoryOn(t *testing.T) {
+	r, _ := Parse([]byte(`{"prompt":"hi"}`), idFn())
+	if !r.UseMemory {
+		t.Error("use_memory should default to true")
+	}
+	r2, _ := Parse([]byte(`{"prompt":"hi","use_memory":false}`), idFn())
+	if r2.UseMemory {
+		t.Error("use_memory:false should be honored")
+	}
+}
+
+func TestBuildRAGInjectsMemoryWithoutRAG(t *testing.T) {
+	fr := &kindRetriever{mem: []rag.Hit{{SourcePath: "memory://preference/ui", Content: "dark mode", Kind: "preference"}}}
+	req := Request{UseRAG: false, UseMemory: true, Prompt: "q"}
+	out := BuildRAG(req, "ORIG", fr, rag.Settings{Enabled: true, TopK: 3, MinScore: 1.0})
+
+	if len(fr.calls) != 1 || len(fr.calls[0].Kinds) == 0 {
+		t.Fatalf("expected one kind-filtered memory call, got %+v", fr.calls)
+	}
+	if !strings.Contains(out.EffectivePrompt, "memory:preference") || !strings.HasSuffix(out.EffectivePrompt, "ORIG") {
+		t.Errorf("memory not labeled/prepended: %q", out.EffectivePrompt)
+	}
+	if out.RagMeta == nil || out.RagMeta["memory"] == nil || out.RagMeta["requested"] != false {
+		t.Errorf("memory meta wrong: %+v", out.RagMeta)
+	}
+}
+
+func TestBuildRAGMemoryBeforeDocs(t *testing.T) {
+	fr := &kindRetriever{
+		mem:  []rag.Hit{{SourcePath: "memory://fact/x", Content: "FACT", Kind: "fact"}},
+		docs: []rag.Hit{{SourcePath: "a.go", ChunkIdx: 1, Content: "CODE"}},
+	}
+	req := Request{UseRAG: true, UseMemory: true, Prompt: "q"}
+	out := BuildRAG(req, "ORIG", fr, rag.Settings{Enabled: true, TopK: 3, MinScore: 1.0})
+
+	mi, di := strings.Index(out.EffectivePrompt, "memory:fact"), strings.Index(out.EffectivePrompt, "a.go")
+	if mi < 0 || di < 0 || mi > di {
+		t.Errorf("expected memory before docs in prompt: %q", out.EffectivePrompt)
+	}
+	if out.RagMeta["memory"] == nil || out.RagMeta["used"] != true {
+		t.Errorf("combined meta wrong: %+v", out.RagMeta)
+	}
+}
+
 func TestBuildRAGDisabledSettingsReports(t *testing.T) {
 	out := BuildRAG(Request{UseRAG: true, Prompt: "q"}, "EFF", &fakeRetriever{}, rag.Settings{Enabled: false})
 	if out.RagMeta["used"] != false || out.RagMeta["reason"] == nil {
