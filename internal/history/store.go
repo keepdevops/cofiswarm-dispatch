@@ -90,6 +90,23 @@ func matches(row map[string]any, q string) bool {
 	return false
 }
 
+// Since returns entries appended at or after cursor (a positional watermark), plus the next cursor
+// to pass on the following call. The log is append-only, so the index is a stable watermark across
+// restarts — letting a reflection pass process only new episodes incrementally (Phase C, C1).
+func (s *Store) Since(cursor int) (rows []map[string]any, next int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(s.rows) {
+		cursor = len(s.rows)
+	}
+	out := make([]map[string]any, len(s.rows)-cursor)
+	copy(out, s.rows[cursor:])
+	return out, len(s.rows)
+}
+
 func (s *Store) Append(entry map[string]any) error {
 	s.mu.Lock()
 	s.rows = append(s.rows, entry)
