@@ -7,11 +7,11 @@ import (
 	"github.com/keepdevops/cofiswarm-dispatch/internal/rag"
 )
 
-// registerRAGRoutes exposes the ported *direct-pgvector* retrieval client
-// (legacy/cpp/rag_client.cpp). This is distinct from compat's /api/rag/health, which proxies to
-// the separate rag service (COFISWARM_RAG_URL) — hence the /api/rag/db-* namespace here.
+// registerRAGRoutes exposes retrieval via the cofiswarm-rag service (sqlite-vec) over HTTP
+// (COFISWARM_RAG_URL). The /api/rag/db-* namespace is retained for back-compat; "db-health" now
+// probes the service /health rather than a direct DB connection.
 // Augmenting the architect prompt with retrieved context (use_rag) lands with the coordinator
-// route-glue port; here we expose retrieve + direct-DB health against the env-configured settings.
+// route-glue port; here we expose retrieve + service health against the env-configured settings.
 func (s *Server) registerRAGRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/rag/db-health", func(w http.ResponseWriter, _ *http.Request) {
 		cors(w)

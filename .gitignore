@@ -1,3 +1,4 @@
+# Test fixture artifacts (keep .gitkeep placeholders)
 test/standalone/opt/cofiswarm/*/bin/*
 !test/standalone/opt/cofiswarm/**/.gitkeep
 test/standalone/var/lib/**/*
@@ -6,6 +7,40 @@ test/standalone/var/log/**/*
 !test/standalone/var/log/**/.gitkeep
 test/standalone/run/**/*
 !test/standalone/run/**/.gitkeep
-.env
-*.log
+
+# Build output
 bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test / coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Dependency / vendor (uncomment if not vendoring)
+# vendor/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
