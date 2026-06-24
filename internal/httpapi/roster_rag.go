@@ -54,3 +54,19 @@ func mergeRosterRAG(req prepare.Request, roster []agent.Agent) prepare.Request {
 	}
 	return req
 }
+
+// withRAGModeConfig returns a mode_config carrying the targeted RAG block so the mode services
+// inject it into the prompts of the targeted agents (the downstream half of mergeRosterRAG).
+// BuildRAG only sets RagBlock when agents are targeted; absent that this returns modeConfig
+// unchanged. Never mutates the caller's map.
+func withRAGModeConfig(modeConfig map[string]any, ragRes prepare.RagResult, ragAgents []string) map[string]any {
+	if ragRes.RagBlock == "" || len(ragAgents) == 0 {
+		return modeConfig
+	}
+	out := make(map[string]any, len(modeConfig)+1)
+	for k, v := range modeConfig {
+		out[k] = v
+	}
+	out["rag"] = map[string]any{"block": ragRes.RagBlock, "agents": ragAgents}
+	return out
+}

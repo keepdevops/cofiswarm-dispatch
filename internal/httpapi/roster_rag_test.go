@@ -68,3 +68,34 @@ func TestMergeRosterRAG(t *testing.T) {
 		}
 	})
 }
+
+func TestWithRAGModeConfig(t *testing.T) {
+	t.Run("no block returns config unchanged", func(t *testing.T) {
+		mc := map[string]any{"max_tokens": 256}
+		got := withRAGModeConfig(mc, prepare.RagResult{RagBlock: ""}, []string{"programmer"})
+		if _, present := got["rag"]; present {
+			t.Errorf("rag key added without a block: %+v", got)
+		}
+	})
+
+	t.Run("block + agents are forwarded without mutating the input", func(t *testing.T) {
+		mc := map[string]any{"max_tokens": 256}
+		got := withRAGModeConfig(mc, prepare.RagResult{RagBlock: "CTX\n"}, []string{"programmer", "security"})
+		if _, present := mc["rag"]; present {
+			t.Errorf("input map was mutated: %+v", mc)
+		}
+		rag, ok := got["rag"].(map[string]any)
+		if !ok {
+			t.Fatalf("rag not forwarded: %+v", got)
+		}
+		if rag["block"] != "CTX\n" {
+			t.Errorf("block = %v", rag["block"])
+		}
+		if agents, ok := rag["agents"].([]string); !ok || len(agents) != 2 {
+			t.Errorf("agents = %v", rag["agents"])
+		}
+		if got["max_tokens"] != 256 {
+			t.Errorf("existing keys dropped: %+v", got)
+		}
+	})
+}
