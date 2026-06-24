@@ -18,6 +18,7 @@ import (
 	"github.com/keepdevops/cofiswarm-dispatch/internal/modes"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/prepare"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/rag"
+	"github.com/keepdevops/cofiswarm-dispatch/internal/registry"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/session"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/stream"
 )
@@ -192,17 +193,19 @@ func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty prompt"})
 		return
 	}
+	req = mergeRosterRAG(req, registry.Roster()) // per-agent use_rag from the roster
 	mode := resolveMode(req.Mode)
 	effPrompt, compaction, ragRes := s.effectivePrompt(req)
 	if ok, reason := s.gateKV(mode, effPrompt); !ok {
 		writeBudgetDenied(w, mode, reason)
 		return
 	}
+	modeCfg := withRAGModeConfig(req.ModeConfig, ragRes, req.RagAgents)
 
 	var envelope map[string]any
 	t0 := time.Now()
 	routing := s.withRoutingContext(mode, req.KVPressure, func() {
-		if env, err := modes.Execute(mode, effPrompt, req.ModeConfig); err == nil {
+		if env, err := modes.Execute(mode, effPrompt, modeCfg); err == nil {
 			envelope = env
 			if meta, ok := envelope["meta"].(map[string]any); ok {
 				meta["relay"] = true
@@ -248,17 +251,19 @@ func (s *Server) handleArchitectStream(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty prompt"})
 		return
 	}
+	req = mergeRosterRAG(req, registry.Roster()) // per-agent use_rag from the roster
 	s.handleArchitectStreamBody(w, r, req)
 }
 
 func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Request, req prepare.Request) {
 	mode := resolveMode(req.Mode)
-	effPrompt, _, _ := s.effectivePrompt(req)
+	effPrompt, _, ragRes := s.effectivePrompt(req)
 	if ok, reason := s.gateKV(mode, effPrompt); !ok {
 		writeBudgetDenied(w, mode, reason)
 		return
 	}
-	if err := modes.StreamRelay(mode, effPrompt, req.SessionID, req.ModeConfig, w); err == nil {
+	modeCfg := withRAGModeConfig(req.ModeConfig, ragRes, req.RagAgents)
+	if err := modes.StreamRelay(mode, effPrompt, req.SessionID, modeCfg, w); err == nil {
 		_ = s.sessions.AppendRun(req.SessionID, map[string]any{
 			"run_id": req.RunID, "prompt": req.Prompt, "effective_prompt": effPrompt,
 			"followup": req.Followup, "mode": mode, "stream": true,
@@ -276,7 +281,7 @@ func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Reques
 	}
 	agent := "architect"
 	prompt := effPrompt
-	if env, err := modes.Execute(mode, prompt, req.ModeConfig); err == nil {
+	if env, err := modes.Execute(mode, prompt, modeCfg); err == nil {
 		if f, ok := env["final"].(string); ok && f != "" {
 			prompt = f
 		}
