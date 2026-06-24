@@ -2,7 +2,7 @@
 
 Orchestration shell: architect dispatch, SSE streaming, sessions, history, RAG inject (extracted from coordinator).
 
-- Migration: Sprint 8 in [MIGRATION-SPRINTS](https://github.com/keepdevops/cofiswarmdev/blob/main/docs/MIGRATION-SPRINTS.md)
+- Migration: Sprint 8 in [MIGRATION-SPRINTS](https://github.com/keepdevops/cofiswarm-docs/blob/main/MIGRATION-SPRINTS.md)
 - SSE contract: `spec/sse-events.md` (from stream-sdk)
 - Legacy C++: `legacy/cpp/`
 
