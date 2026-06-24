@@ -4,6 +4,7 @@
 package registry
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -50,4 +51,22 @@ func fetchAgentFrom(base, name string) (agent.Agent, error) {
 		}
 	}
 	return agent.Agent{}, fmt.Errorf("agent %q not found in registry roster (%d agents)", name, len(roster))
+}
+
+// PutAgent upserts an agent into the registry (POST /api/agents). Used by dispatch to self-register
+// the reflector so it need not be pre-seeded in swarm-config.json. Idempotent: re-posting the same
+// agent just replaces it. Callers fail open — a failed registration must not stop dispatch.
+func PutAgent(a agent.Agent) error {
+	raw, _ := json.Marshal(a)
+	url := URL() + "/api/agents"
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("registry POST %s status=%d", url, resp.StatusCode)
+	}
+	return nil
 }

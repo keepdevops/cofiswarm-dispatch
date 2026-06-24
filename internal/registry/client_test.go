@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/keepdevops/cofiswarm-dispatch/internal/agent"
 )
 
 const rosterJSON = `[
@@ -58,4 +60,49 @@ func TestFetchAgentUnreachable(t *testing.T) {
 	if _, err := fetchAgentFrom(url, "reflector"); err == nil {
 		t.Error("expected error when registry is unreachable")
 	}
+}
+
+func TestPutAgent(t *testing.T) {
+	var gotPath, gotBody string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		buf := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(buf)
+		gotBody = string(buf)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer ts.Close()
+	t.Setenv("COFISWARM_AGENT_REGISTRY_URL", ts.URL)
+
+	if err := PutAgent(agent.Agent{Name: "reflector", Port: 8085, Engine: "llama"}); err != nil {
+		t.Fatalf("PutAgent: %v", err)
+	}
+	if gotPath != "/api/agents" {
+		t.Errorf("path: want /api/agents, got %s", gotPath)
+	}
+	if !contains(gotBody, `"name":"reflector"`) {
+		t.Errorf("body missing agent: %s", gotBody)
+	}
+}
+
+func TestPutAgentNon2xx(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer ts.Close()
+	t.Setenv("COFISWARM_AGENT_REGISTRY_URL", ts.URL)
+	if err := PutAgent(agent.Agent{Name: "x", Port: 1, Engine: "l"}); err == nil {
+		t.Error("expected error on 400 (fail-open path for caller)")
+	}
+}
+
+func contains(s, sub string) bool { return len(s) >= len(sub) && bytesIndex(s, sub) >= 0 }
+
+func bytesIndex(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }

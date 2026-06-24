@@ -66,6 +66,16 @@ func (s *Server) StartReflection(ctx context.Context, cursorPath string) bool {
 		log.Printf("[reflect] not started: no reflector port (registry %q had none and COFISWARM_REFLECT_AGENT_PORT unset)", reflector.Name)
 		return false
 	}
+	// Self-register the reflector so it need not be pre-seeded in swarm-config.json (idempotent
+	// upsert). Default-on; opt out with COFISWARM_REFLECT_NO_SELF_REGISTER. Fails open: a down or
+	// rejecting registry only logs — it must not stop the reflection tick.
+	if !envTruthy("COFISWARM_REFLECT_NO_SELF_REGISTER") {
+		if err := registry.PutAgent(reflector); err != nil {
+			log.Printf("[reflect] self-register %q failed (continuing): %v", reflector.Name, err)
+		} else {
+			log.Printf("[reflect] self-registered %q with the agent registry", reflector.Name)
+		}
+	}
 	completer := agentCompleter{client: s.agents, a: reflector}
 	sink := ragMemorySink{client: s.rag, cfg: s.ragCfg}
 
