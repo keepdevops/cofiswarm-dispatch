@@ -28,6 +28,11 @@ type Agent struct {
 	MaxTokens        int      `json:"max_tokens"`
 	ContextWindow    int      `json:"context_window"`
 	ReadTimeoutSecs  int      `json:"read_timeout_secs"`
+	// Per-agent RAG targeting, resolved from the agent-registry roster: when UseRAG is
+	// set the prepare step injects retrieved context for this agent (see mergeRosterRAG).
+	UseRAG   bool     `json:"use_rag"`
+	RagTopK  int      `json:"rag_top_k"`
+	RagKinds []string `json:"rag_kinds"`
 }
 
 // toBackend projects the routing-relevant subset for internal/backend.

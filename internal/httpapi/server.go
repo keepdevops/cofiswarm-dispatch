@@ -18,6 +18,7 @@ import (
 	"github.com/keepdevops/cofiswarm-dispatch/internal/modes"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/prepare"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/rag"
+	"github.com/keepdevops/cofiswarm-dispatch/internal/registry"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/session"
 	"github.com/keepdevops/cofiswarm-dispatch/internal/stream"
 )
@@ -192,6 +193,7 @@ func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty prompt"})
 		return
 	}
+	req = mergeRosterRAG(req, registry.Roster()) // per-agent use_rag from the roster
 	mode := resolveMode(req.Mode)
 	effPrompt, compaction, ragRes := s.effectivePrompt(req)
 	if ok, reason := s.gateKV(mode, effPrompt); !ok {
@@ -248,6 +250,7 @@ func (s *Server) handleArchitectStream(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "empty prompt"})
 		return
 	}
+	req = mergeRosterRAG(req, registry.Roster()) // per-agent use_rag from the roster
 	s.handleArchitectStreamBody(w, r, req)
 }
 
