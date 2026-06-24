@@ -62,7 +62,8 @@ func main() {
 		log.Printf("dispatch publishing presence/alerts to bus via %s", base)
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: httpapi.New(sessions, hist, alerter).Handler()}
+	api := httpapi.New(sessions, hist, alerter)
+	srv := &http.Server{Addr: *addr, Handler: api.Handler()}
 	go func() {
 		log.Printf("dispatch listening on %s (sessions=%d history=%d)", *addr, sessions.Count(), hist.Len())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -74,6 +75,11 @@ func main() {
 	// observer's TTL), then drain in-flight requests before exiting.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Background episodic reflection (Phase C, Tier 3). Opt-in via COFISWARM_REFLECT_ENABLED;
+	// bound to ctx so it drains on shutdown. The cursor lives under the state root.
+	reflectCursor := filepath.Join(*state, "reflect", "cursor")
+	api.StartReflection(ctx, reflectCursor)
 	<-ctx.Done()
 	log.Printf("dispatch: shutting down")
 	stopWatch()
