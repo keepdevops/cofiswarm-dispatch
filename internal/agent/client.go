@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -30,9 +31,16 @@ type Client struct {
 	host   string // inference host; agents listen on host:port
 }
 
-// NewClient builds a caller bound to a backend router. host defaults to 127.0.0.1.
+// NewClient builds a caller bound to a backend router. The inference host defaults to
+// 127.0.0.1 (component co-located with its llama/MLX servers, the standalone host
+// deployment); COFISWARM_AGENT_HOST overrides it so the same binary runs anywhere the
+// servers are reachable under a different name (e.g. host.docker.internal in a container).
 func NewClient(router *backend.Router) *Client {
-	return &Client{router: router, http: &http.Client{}, host: "127.0.0.1"}
+	host := os.Getenv("COFISWARM_AGENT_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return &Client{router: router, http: &http.Client{}, host: host}
 }
 
 // Call resolves the agent's backend, invokes it, and retries transient failures with a
