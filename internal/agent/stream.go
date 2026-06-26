@@ -43,8 +43,15 @@ func (c *Client) Stream(a Agent, systemPrompt, prompt string, onChunk func(strin
 		}()
 	}
 
-	url := fmt.Sprintf("http://%s:%d/v1/chat/completions", c.host, work.Port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(streamBody(work, sys, prompt)))
+	body := streamBody(work, sys, prompt)
+	var req *http.Request
+	var err error
+	if c.bus != "" {
+		req, err = c.busStreamRequest(ctx, work, body)
+	} else {
+		url := fmt.Sprintf("http://%s:%d/v1/chat/completions", c.host, work.Port)
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	}
 	if err != nil {
 		log.Printf("[agent_stream] %s build request: %v", a.Name, err)
 		return notResponding(a)
@@ -63,12 +70,18 @@ func (c *Client) Stream(a Agent, systemPrompt, prompt string, onChunk func(strin
 		return msg
 	}
 	defer resp.Body.Close()
+	return c.drainStream(a, resp.Body, onChunk, cancel)
+}
 
+// drainStream parses the SSE response body, invoking onChunk per token delta and returning the
+// accumulated text. Shared by the direct-HTTP and bus stream paths (the bus gateway passes the
+// backend's SSE bytes through verbatim, so the same drainer reconstructs the stream).
+func (c *Client) drainStream(a Agent, body io.Reader, onChunk func(string), cancel <-chan struct{}) string {
 	var acc strings.Builder
 	drainer := newSSEDrainer(&acc, onChunk)
 	readBuf := make([]byte, 4096)
 	for {
-		n, rerr := resp.Body.Read(readBuf)
+		n, rerr := body.Read(readBuf)
 		if n > 0 {
 			drainer.feed(readBuf[:n])
 		}

@@ -24,23 +24,27 @@ const (
 // llamaStops are the template tokens llama.cpp must stop on (and that we strip if leaked).
 var llamaStops = []string{"<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|start_header_id|>", "<|endoftext|>"}
 
-// Client calls agents over HTTP, choosing a backend per-agent via the shared router.
+// Client calls agents over HTTP, choosing a backend per-agent via the shared router. When bus
+// routing is enabled (see busRouteURL) it instead routes inference through the zmq-bridge's
+// request/reply gateway, keyed by the agent's inference port.
 type Client struct {
 	router *backend.Router
 	http   *http.Client
 	host   string // inference host; agents listen on host:port
+	bus    string // bridge base URL when bus routing is on, else "" (direct HTTP)
 }
 
 // NewClient builds a caller bound to a backend router. The inference host defaults to
 // 127.0.0.1 (component co-located with its llama/MLX servers, the standalone host
 // deployment); COFISWARM_AGENT_HOST overrides it so the same binary runs anywhere the
 // servers are reachable under a different name (e.g. host.docker.internal in a container).
+// When COFISWARM_ROUTE_BUS and COFISWARM_BRIDGE_URL are set, inference routes over the bus.
 func NewClient(router *backend.Router) *Client {
 	host := os.Getenv("COFISWARM_AGENT_HOST")
 	if host == "" {
 		host = "127.0.0.1"
 	}
-	return &Client{router: router, http: &http.Client{}, host: host}
+	return &Client{router: router, http: &http.Client{}, host: host, bus: busRouteURL()}
 }
 
 // Call resolves the agent's backend, invokes it, and retries transient failures with a
@@ -115,11 +119,9 @@ func materializedEngine(id backend.ID) string {
 	return "llama"
 }
 
-// completeOnce performs one /v1/chat/completions call with engine-specific request shaping and
-// records a latency probe sample for the router's EMA on success (mirrors call_agent_once core).
-func (c *Client) completeOnce(a Agent, systemPrompt, prompt, _ string) AttemptResult {
-	var out AttemptResult
-
+// completionBody shapes the engine-specific /v1/chat/completions request body shared by the
+// HTTP and bus paths (messages, max_tokens, optional model, llama stop/cache tuning).
+func completionBody(a Agent, systemPrompt, prompt string) map[string]any {
 	// Enforce max_input_tokens cap: ~4 chars per token (rough estimate).
 	eff := prompt
 	if a.MaxInputTokens > 0 && len(prompt) > a.MaxInputTokens*4 {
@@ -129,7 +131,6 @@ func (c *Client) completeOnce(a Agent, systemPrompt, prompt, _ string) AttemptRe
 	if outCap <= 0 {
 		outCap = a.MaxTokens
 	}
-
 	body := map[string]any{"messages": buildMessages(a, systemPrompt, eff), "max_tokens": outCap}
 	if a.Model != "" && (a.Backend == "docker" || a.Backend == "vllm" || a.Backend == "docker-vllm") {
 		body["model"] = a.Model
@@ -141,7 +142,19 @@ func (c *Client) completeOnce(a Agent, systemPrompt, prompt, _ string) AttemptRe
 		body["cache_prompt"] = true
 		body["stop"] = llamaStops
 	}
+	return body
+}
 
+// completeOnce performs one /v1/chat/completions call with engine-specific request shaping and
+// records a latency probe sample for the router's EMA on success (mirrors call_agent_once core).
+// When bus routing is enabled it routes through the zmq-bridge instead of direct HTTP.
+func (c *Client) completeOnce(a Agent, systemPrompt, prompt, sessionID string) AttemptResult {
+	if c.bus != "" {
+		return c.completeOnceBus(a, systemPrompt, prompt)
+	}
+	var out AttemptResult
+
+	body := completionBody(a, systemPrompt, prompt)
 	raw, err := json.Marshal(body)
 	if err != nil {
 		log.Printf("[dispatch] marshal request for %s: %v", a.Name, err)
