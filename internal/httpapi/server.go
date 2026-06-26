@@ -84,6 +84,15 @@ func writeBudgetDenied(w http.ResponseWriter, mode, reason string) {
 	})
 }
 
+// writeModeUnavailable fails loudly when the mode service is unreachable, rather
+// than echoing the prompt back as a fabricated answer.
+func writeModeUnavailable(w http.ResponseWriter, mode string, cause error) {
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": fmt.Sprintf("mode %q unavailable: %v", mode, cause), "mode": mode,
+	})
+}
+
 func cors(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 }
@@ -203,26 +212,30 @@ func (s *Server) handleArchitect(w http.ResponseWriter, r *http.Request) {
 	modeCfg := withRAGModeConfig(req.ModeConfig, ragRes, req.RagAgents)
 
 	var envelope map[string]any
+	var execErr error
 	t0 := time.Now()
 	routing := s.withRoutingContext(mode, req.KVPressure, func() {
-		if env, err := modes.Execute(mode, effPrompt, modeCfg); err == nil {
-			envelope = env
-			if meta, ok := envelope["meta"].(map[string]any); ok {
-				meta["relay"] = true
-			} else {
-				envelope["meta"] = map[string]any{"relay": true}
-			}
+		env, err := modes.Execute(mode, effPrompt, modeCfg)
+		if err != nil {
+			execErr = err
+			return
+		}
+		envelope = env
+		if meta, ok := envelope["meta"].(map[string]any); ok {
+			meta["relay"] = true
 		} else {
-			if s.alerter != nil {
-				s.alerter.Alert(fmt.Sprintf("mode %q execute unavailable: %v", mode, err))
-			}
-			envelope = map[string]any{
-				"mode": mode, "final": effPrompt,
-				"agents": map[string]string{"architect": effPrompt},
-				"meta":   map[string]any{"stub": true, "relay_error": err.Error()},
-			}
+			envelope["meta"] = map[string]any{"relay": true}
 		}
 	})
+	if execErr != nil {
+		// The mode service is genuinely unavailable. Fail loudly and do not
+		// persist a fabricated run instead of echoing the prompt.
+		if s.alerter != nil {
+			s.alerter.Alert(fmt.Sprintf("mode %q execute unavailable: %v", mode, execErr))
+		}
+		writeModeUnavailable(w, mode, execErr)
+		return
+	}
 	wallMs := float64(time.Since(t0).Microseconds()) / 1000.0
 	prepare.StampMeta(envelope, req, ragRes, compaction, wallMs, routing)
 
@@ -279,23 +292,34 @@ func (s *Server) handleArchitectStreamBody(w http.ResponseWriter, _ *http.Reques
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	agent := "architect"
-	prompt := effPrompt
-	if env, err := modes.Execute(mode, prompt, modeCfg); err == nil {
-		if f, ok := env["final"].(string); ok && f != "" {
-			prompt = f
+	// Non-streaming fallback: some mode services answer /v1/execute but not
+	// /v1/execute/stream. Replay the genuine result as a token stream. If the
+	// service is unavailable (or returns nothing), fail loudly with an SSE
+	// error event rather than echoing the prompt back as a fabricated answer.
+	env, execErr := modes.Execute(mode, effPrompt, modeCfg)
+	if execErr != nil {
+		if s.alerter != nil {
+			s.alerter.Alert(fmt.Sprintf("mode %q execute unavailable: %v", mode, execErr))
 		}
-		if agents, ok := env["agents"].(map[string]any); ok {
-			for k := range agents {
-				agent = k
-				break
-			}
-		}
-	}
-	if err := stream.EmitFlatStub(sw, req.SessionID, agent, prompt); err != nil {
+		_ = stream.EmitError(sw, req.SessionID, mode, execErr)
 		return
 	}
-	final := strings.TrimSpace(prompt)
+	final, _ := env["final"].(string)
+	final = strings.TrimSpace(final)
+	if final == "" {
+		_ = stream.EmitError(sw, req.SessionID, mode, fmt.Errorf("empty result"))
+		return
+	}
+	agent := "architect"
+	if agents, ok := env["agents"].(map[string]any); ok {
+		for k := range agents {
+			agent = k
+			break
+		}
+	}
+	if err := stream.EmitFlatReplay(sw, req.SessionID, agent, final); err != nil {
+		return
+	}
 	_ = s.sessions.AppendRun(req.SessionID, map[string]any{
 		"run_id": req.RunID, "prompt": req.Prompt, "effective_prompt": effPrompt,
 		"followup": req.Followup, "mode": mode, "final": final,
